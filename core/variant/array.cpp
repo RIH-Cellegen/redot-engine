@@ -250,29 +250,36 @@ void Array::assign(const Array &p_array) {
 		}
 
 		// Check if types are compatible for direct assignment
-		if (typed == source_typed || typed.type == Variant::NIL ||
-			(source_typed.type == Variant::OBJECT && typed.can_reference(source_typed))) {
+		if (typed == source_typed) {
+			// Use memcpy for direct memory copy when types are identical
+			_p->array.resize(p_array._p->array.size());
+			memcpy(_p->array.ptrw(), p_array._p->array.ptr(), p_array._p->array.size() * sizeof(Variant));
+			return;
+		}
+
+		if (typed.type == Variant::NIL || (source_typed.type == Variant::OBJECT && typed.can_reference(source_typed))) {
+			// Handle other direct assignment cases
 			_p->array = p_array._p->array;
-		return;
+			return;
+		}
+
+		const Variant *source = p_array._p->array.ptr();
+		int size = p_array._p->array.size();
+
+		// Handle specific type conversion cases
+		if ((source_typed.type == Variant::NIL && typed.type == Variant::OBJECT) ||
+			(source_typed.type == Variant::OBJECT && source_typed.can_reference(typed))) {
+			// Validate object types before assignment
+			for (int i = 0; i < size; i++) {
+				const Variant &element = source[i];
+				if (element.get_type() != Variant::NIL &&
+					(element.get_type() != Variant::OBJECT || !typed.validate_object(element, "assign"))) {
+					ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
+					}
 			}
-
-			const Variant *source = p_array._p->array.ptr();
-			int size = p_array._p->array.size();
-
-			// Handle specific type conversion cases
-			if ((source_typed.type == Variant::NIL && typed.type == Variant::OBJECT) ||
-				(source_typed.type == Variant::OBJECT && source_typed.can_reference(typed))) {
-				// Validate object types before assignment
-				for (int i = 0; i < size; i++) {
-					const Variant &element = source[i];
-					if (element.get_type() != Variant::NIL &&
-						(element.get_type() != Variant::OBJECT || !typed.validate_object(element, "assign"))) {
-						ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
-						}
-				}
 		_p->array = p_array._p->array;
 		return;
-				}
+			}
 
 	// Handle incompatible types
 	if (typed.type == Variant::OBJECT || source_typed.type == Variant::OBJECT) {
