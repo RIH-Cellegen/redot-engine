@@ -234,6 +234,24 @@ void Array::operator=(const Array &p_array) {
 	_ref(p_array);
 }
 
+void Array::push_back(const Variant &p_value) {
+	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
+	Variant value = p_value;
+	ERR_FAIL_COND(!_p->typed.validate(value, "push_back"));
+	_p->array.push_back(value);
+}
+
+void Array::append_array(const Array &p_array) {
+	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
+
+	Vector<Variant> validated_array = p_array._p->array;
+	for (int i = 0; i < validated_array.size(); ++i) {
+		ERR_FAIL_COND(!_p->typed.validate(validated_array.write[i], "append_array"));
+	}
+
+	_p->array.append_array(validated_array);
+}
+
 void Array::assign(const Array &p_array) {
 	// Early exit if the source and destination are the same object
 	if (this == &p_array) {
@@ -291,9 +309,11 @@ void Array::assign(const Array &p_array) {
 			}
 
 			// Perform type conversion for primitive types
-			Vector<Variant> array;
-			array.resize(size);
-			Variant *data = array.ptrw();
+			if (_p->array.size() != size) {
+				// Resize the destination array only if necessary
+				_p->array.resize(size);
+			}
+			Variant *data = _p->array.ptrw(); // Reuse existing memory
 
 			if (source_typed.type == Variant::NIL && typed.type != Variant::OBJECT) {
 				// Convert from variants to primitives
@@ -321,89 +341,76 @@ void Array::assign(const Array &p_array) {
 			} else {
 				ERR_FAIL_MSG(vformat(type_assignment_error, Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
 			}
-
-			_p->array = array;
-}
-
-void Array::push_back(const Variant &p_value) {
-	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
-	Variant value = p_value;
-	ERR_FAIL_COND(!_p->typed.validate(value, "push_back"));
-	_p->array.push_back(value);
-}
-
-void Array::append_array(const Array &p_array) {
-	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
-
-	Vector<Variant> validated_array = p_array._p->array;
-	for (int i = 0; i < validated_array.size(); ++i) {
-		ERR_FAIL_COND(!_p->typed.validate(validated_array.write[i], "append_array"));
-	}
-
-	_p->array.append_array(validated_array);
 }
 
 Error Array::resize(int p_new_size) {
+	// Early exit if the array is in read-only state
 	ERR_FAIL_COND_V_MSG(_p->read_only, ERR_LOCKED, "Array is in read-only state.");
 
-	// Return early if the new size is equal to the current size
+	// Early exit if the new size is equal to the current size
 	int current_size = _p->array.size();
 	if (p_new_size == current_size) {
 		return OK;
 	}
 
-	// Return early if the new size is invalid (e.g., negative)
+	// Early exit if the new size is invalid (e.g., negative)
 	if (p_new_size < 0) {
 		print_error("Invalid size provided. Size cannot be negative.");
 		return ERR_INVALID_PARAMETER;
 	}
 
+	// Precompute error message templates to avoid repeated string formatting
+	static constexpr const char *memory_error = "Requested size exceeds the maximum allowable size based on system memory. Size capped.";
+	static constexpr const char *resize_error = "Failed to resize array.";
+
 	// Estimate memory usage per entry (adjust as necessary for your platform)
-	const size_t MEMORY_PER_ENTRY = sizeof(Variant) + 64; // Example: Variant size + overhead
+	constexpr size_t MEMORY_PER_ENTRY = sizeof(Variant) + 64; // Example: Variant size + overhead
 
 	// Get total system memory
 	struct sysinfo info;
 	if (sysinfo(&info) != 0) {
 		print_error("Failed to retrieve system memory information. Using default limit.");
-		if (p_new_size > 1000000) { // Default hard limit as a fallback
+		constexpr int DEFAULT_MAX_SIZE = 1000000; // Default hard limit as a fallback
+		if (p_new_size > DEFAULT_MAX_SIZE) {
 			print_error("Requested size exceeds the default maximum array size. Size capped at 1,000,000 entries.");
-			p_new_size = 1000000;
+			p_new_size = DEFAULT_MAX_SIZE;
 		}
 	} else {
-		size_t max_memory = info.totalram / 2; // Use half of the total system memory for safety
+		constexpr size_t MEMORY_SAFETY_FACTOR = 2; // Use half of the total system memory for safety
+		size_t max_memory = info.totalram / MEMORY_SAFETY_FACTOR;
 		size_t max_entries = max_memory / MEMORY_PER_ENTRY;
 
 		if (p_new_size > max_entries) {
-			print_error("Requested size exceeds the maximum allowable size based on system memory. Size capped.");
+			print_error(memory_error);
 			p_new_size = static_cast<int>(max_entries);
 		}
 	}
 
 	Variant::Type &variant_type = _p->typed.type;
 
-	// Check if a preallocated buffer is available for reuse
+	// Reuse preallocated buffer if available
 	if (p_new_size > current_size && preallocated_buffers.count(p_new_size)) {
-		_p->array = preallocated_buffers[p_new_size];
+		_p->array = std::move(preallocated_buffers[p_new_size]); // Use std::move for efficient transfer
 		preallocated_buffers.erase(p_new_size); // Remove from cache after reuse
 	} else {
 		// Preallocate buffer if necessary
-		static const int BUFFER_EXTRA_SPACE = 1024; // Extra space to reduce frequent allocations
+		constexpr int BUFFER_EXTRA_SPACE = 1024; // Extra space to reduce frequent allocations
 		if (p_new_size > current_size) {
 			int new_buffer_size = std::max(p_new_size + BUFFER_EXTRA_SPACE, current_size * 2);
 			Error resize_err = _p->array.resize(new_buffer_size);
 			if (resize_err) {
-				print_error("Failed to resize array buffer during preallocation.");
+				print_error(resize_error);
 				return resize_err;
 			}
 		}
 	}
 
-	// Get the current size and resize the array
+	// Resize the array and zero-initialize new elements
 	Error err = _p->array.resize_zeroed(p_new_size);
 
-	// Return early if resizing failed
+	// Early exit if resizing failed
 	if (err != OK) {
-		print_error("Failed to resize array.");
+		print_error(resize_error);
 		return err;
 	}
 
@@ -411,45 +418,54 @@ Error Array::resize(int p_new_size) {
 	if (p_new_size > current_size && variant_type != Variant::NIL && variant_type != Variant::OBJECT) {
 		Variant *write_ptr = _p->array.ptrw(); // Access the array memory once
 
-		// Initialize new elements in chunks to optimize performance using multithreading
-		const int CHUNK_SIZE = 1024; // Number of elements to initialize per batch
-		int total_chunks = (p_new_size - current_size + CHUNK_SIZE - 1) / CHUNK_SIZE; // Calculate total chunks
-
-		unsigned int hardware_threads = std::thread::hardware_concurrency();
-		if (hardware_threads == 0) {
-			hardware_threads = 4; // Fallback to 4 threads if hardware concurrency is unavailable
-		}
-
-		std::atomic<int> current_chunk(0);
-		auto initialize_chunks = [&]() {
-			// Set thread affinity to improve cache locality and reduce context switching
-			cpu_set_t cpuset;
-			CPU_ZERO(&cpuset);
-			int cpu_id = current_chunk % hardware_threads;
-			CPU_SET(cpu_id, &cpuset);
-			sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-
-			while (true) {
-				int chunk_index = current_chunk.fetch_add(1);
-				if (chunk_index >= total_chunks) {
-					break;
-				}
-				int start = current_size + chunk_index * CHUNK_SIZE;
-				int end = std::min(start + CHUNK_SIZE, p_new_size);
-				for (int i = start; i < end; i++) {
-					VariantInternal::initialize(&write_ptr[i], variant_type);
-				}
+		// Use batch initialization for small arrays
+		constexpr int BATCH_THRESHOLD = 4096; // Threshold for using batch initialization
+		if (p_new_size - current_size <= BATCH_THRESHOLD) {
+			// Single-threaded batch initialization
+			for (int i = current_size; i < p_new_size; i++) {
+				VariantInternal::initialize(&write_ptr[i], variant_type);
 			}
-		};
+		} else {
+			// Multithreaded initialization for large arrays
+			constexpr int CHUNK_SIZE = 1024; // Number of elements to initialize per batch
+			int total_chunks = (p_new_size - current_size + CHUNK_SIZE - 1) / CHUNK_SIZE; // Calculate total chunks
 
-		std::vector<std::thread> threads;
-		for (unsigned int i = 0; i < hardware_threads; i++) {
-			threads.emplace_back(initialize_chunks);
-		}
+			constexpr unsigned int HARDWARE_THREADS_FALLBACK = 4; // Fallback to 4 threads if hardware concurrency is unavailable
+			unsigned int hardware_threads = std::thread::hardware_concurrency();
+			if (hardware_threads == 0) {
+				hardware_threads = HARDWARE_THREADS_FALLBACK;
+			}
 
-		// Join all threads
-		for (auto &t : threads) {
-			t.join();
+			std::atomic<int> current_chunk(0);
+			auto initialize_chunks = [&](int thread_id) {
+				// Set thread affinity to improve cache locality and reduce context switching
+				cpu_set_t cpuset;
+				CPU_ZERO(&cpuset);
+				CPU_SET(thread_id, &cpuset); // Bind thread to a specific CPU core
+				sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+				while (true) {
+					int chunk_index = current_chunk.fetch_add(1);
+					if (chunk_index >= total_chunks) {
+						break;
+					}
+					int start = current_size + chunk_index * CHUNK_SIZE;
+					int end = std::min(start + CHUNK_SIZE, p_new_size);
+					for (int i = start; i < end; i++) {
+						VariantInternal::initialize(&write_ptr[i], variant_type);
+					}
+				}
+			};
+
+			std::vector<std::thread> threads;
+			for (unsigned int i = 0; i < hardware_threads; i++) {
+				threads.emplace_back(initialize_chunks, i); // Pass thread ID to bind to specific core
+			}
+
+			// Join all threads
+			for (auto &t : threads) {
+				t.join();
+			}
 		}
 	}
 
