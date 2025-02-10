@@ -486,9 +486,16 @@ Error Array::insert(int p_pos, const Variant &p_value) {
 }
 
 void Array::fill(const Variant &p_value) {
+	// Early exit if the array is in read-only state
 	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
-	Variant value = p_value;
-	ERR_FAIL_COND(!_p->typed.validate(value, "fill"));
+
+	// Use std::move to transfer ownership of the value if possible
+	Variant value = std::move(p_value);
+
+	// Validate the value against the array's type
+	ERR_FAIL_COND_MSG(!_p->typed.validate(value, "fill"), "Invalid value for array type.");
+
+	// Fill the array with the validated value
 	_p->array.fill(value);
 }
 
