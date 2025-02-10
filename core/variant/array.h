@@ -118,6 +118,8 @@ public:
 	Variant &operator[](int p_idx);
 	const Variant &operator[](int p_idx) const;
 
+	void cache_preallocated_buffer(int) const;
+
 	void set(int p_idx, const Variant &p_value);
 	const Variant &get(int p_idx) const;
 

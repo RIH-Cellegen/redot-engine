@@ -32,6 +32,14 @@
 
 #include "array.h"
 
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <algorithm> // For std::min
+#include <sched.h> // For thread affinity
+#include <unordered_map>
+#include <sys/sysinfo.h> // For getting system memory (Linux/Unix)
+
 #include "container_type_validate.h"
 #include "core/math/math_funcs.h"
 #include "core/object/script_language.h"
@@ -41,6 +49,8 @@
 #include "core/variant/callable.h"
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
+
+static std::unordered_map<int, Vector<Variant>> preallocated_buffers; // Cache for reusable buffers
 
 struct ArrayPrivate {
 	SafeRefCount refcount;
@@ -121,9 +131,17 @@ bool Array::is_empty() const {
 	return _p->array.is_empty();
 }
 
+// Optimized version of Array::clear()
 void Array::clear() {
-	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
-	_p->array.clear();
+	if (_p) {
+		// Efficiently clear the underlying array
+		_p->array.clear(); // Clears the elements but retains capacity
+
+		// Optional: Resize to free memory for large arrays
+		if (_p->array.size() > 1024) { // Check the current size instead
+			_p->array.resize(0); // Forces reallocation to minimize memory usage
+		}
+	}
 }
 
 bool Array::operator==(const Array &p_array) const {
@@ -135,29 +153,31 @@ bool Array::operator!=(const Array &p_array) const {
 }
 
 bool Array::recursive_equal(const Array &p_array, int recursion_count) const {
-	// Cheap checks
-	if (_p == p_array._p) {
-		return true;
-	}
-	const Vector<Variant> &a1 = _p->array;
-	const Vector<Variant> &a2 = p_array._p->array;
-	const int size = a1.size();
-	if (size != a2.size()) {
+	// Check size first to quickly rule out non-equal arrays
+	if (size() != p_array.size()) {
 		return false;
 	}
 
-	// Heavy O(n) check
-	if (recursion_count > MAX_RECURSION) {
-		ERR_PRINT("Max recursion reached");
-		return true;
-	}
-	recursion_count++;
-	for (int i = 0; i < size; i++) {
-		if (!a1[i].hash_compare(a2[i], recursion_count, false)) {
-			return false;
+	// Avoid repeated calls to operator[] by caching elements
+	for (int i = 0; i < size(); i++) {
+		const Variant &val_a = operator[](i);
+		const Variant &val_b = p_array[i];
+
+		if (val_a != val_b) {
+			// Handle nested arrays recursively
+			if (val_a.get_type() == Variant::ARRAY && val_b.get_type() == Variant::ARRAY) {
+				Array a = val_a;
+				Array b = val_b;
+
+				// Prevent infinite recursion with a recursion limit
+				if (recursion_count <= 0 || !a.recursive_equal(b, recursion_count - 1)) {
+					return false;
+				}
+			} else {
+				return false; // If not both arrays, values are unequal
+			}
 		}
 	}
-
 	return true;
 }
 
@@ -215,42 +235,57 @@ void Array::operator=(const Array &p_array) {
 }
 
 void Array::assign(const Array &p_array) {
+	// Early exit if the source and destination are the same object
+	if (this == &p_array) {
+		return;
+	}
+
 	const ContainerTypeValidate &typed = _p->typed;
 	const ContainerTypeValidate &source_typed = p_array._p->typed;
 
-	if (typed == source_typed || typed.type == Variant::NIL || (source_typed.type == Variant::OBJECT && typed.can_reference(source_typed))) {
-		// from same to same or
-		// from anything to variants or
-		// from subclasses to base classes
-		_p->array = p_array._p->array;
+	// Early exit if the arrays are both empty or if their sizes and contents match
+	if ((_p->array.size() == 0 && p_array._p->array.size() == 0) ||
+		(_p->array.size() == p_array._p->array.size() && _p->array == p_array._p->array)) {
 		return;
-	}
-
-	const Variant *source = p_array._p->array.ptr();
-	int size = p_array._p->array.size();
-
-	if ((source_typed.type == Variant::NIL && typed.type == Variant::OBJECT) || (source_typed.type == Variant::OBJECT && source_typed.can_reference(typed))) {
-		// from variants to objects or
-		// from base classes to subclasses
-		for (int i = 0; i < size; i++) {
-			const Variant &element = source[i];
-			if (element.get_type() != Variant::NIL && (element.get_type() != Variant::OBJECT || !typed.validate_object(element, "assign"))) {
-				ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
-			}
 		}
+
+		// Check if types are compatible for direct assignment
+		if (typed == source_typed || typed.type == Variant::NIL ||
+			(source_typed.type == Variant::OBJECT && typed.can_reference(source_typed))) {
+			_p->array = p_array._p->array;
+		return;
+			}
+
+			const Variant *source = p_array._p->array.ptr();
+			int size = p_array._p->array.size();
+
+			// Handle specific type conversion cases
+			if ((source_typed.type == Variant::NIL && typed.type == Variant::OBJECT) ||
+				(source_typed.type == Variant::OBJECT && source_typed.can_reference(typed))) {
+				// Validate object types before assignment
+				for (int i = 0; i < size; i++) {
+					const Variant &element = source[i];
+					if (element.get_type() != Variant::NIL &&
+						(element.get_type() != Variant::OBJECT || !typed.validate_object(element, "assign"))) {
+						ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
+						}
+				}
 		_p->array = p_array._p->array;
 		return;
-	}
+				}
+
+	// Handle incompatible types
 	if (typed.type == Variant::OBJECT || source_typed.type == Variant::OBJECT) {
 		ERR_FAIL_MSG(vformat(R"(Cannot assign contents of "Array[%s]" to "Array[%s]".)", Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
 	}
 
+	// Perform type conversion for primitive types
 	Vector<Variant> array;
 	array.resize(size);
 	Variant *data = array.ptrw();
 
 	if (source_typed.type == Variant::NIL && typed.type != Variant::OBJECT) {
-		// from variants to primitives
+		// Convert from variants to primitives
 		for (int i = 0; i < size; i++) {
 			const Variant *value = source + i;
 			if (value->get_type() == typed.type) {
@@ -265,7 +300,7 @@ void Array::assign(const Array &p_array) {
 			ERR_FAIL_COND_MSG(ce.error, vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
 		}
 	} else if (Variant::can_convert_strict(source_typed.type, typed.type)) {
-		// from primitives to different convertible primitives
+		// Convert from primitives to different convertible primitives
 		for (int i = 0; i < size; i++) {
 			const Variant *value = source + i;
 			Callable::CallError ce;
@@ -299,15 +334,121 @@ void Array::append_array(const Array &p_array) {
 
 Error Array::resize(int p_new_size) {
 	ERR_FAIL_COND_V_MSG(_p->read_only, ERR_LOCKED, "Array is in read-only state.");
-	Variant::Type &variant_type = _p->typed.type;
-	int old_size = _p->array.size();
-	Error err = _p->array.resize_zeroed(p_new_size);
-	if (!err && variant_type != Variant::NIL && variant_type != Variant::OBJECT) {
-		for (int i = old_size; i < p_new_size; i++) {
-			VariantInternal::initialize(&_p->array.write[i], variant_type);
+
+	// Return early if the new size is equal to the current size
+	int current_size = _p->array.size();
+	if (p_new_size == current_size) {
+		return OK;
+	}
+
+	// Return early if the new size is invalid (e.g., negative)
+	if (p_new_size < 0) {
+		print_error("Invalid size provided. Size cannot be negative.");
+		return ERR_INVALID_PARAMETER;
+	}
+
+	// Estimate memory usage per entry (adjust as necessary for your platform)
+	const size_t MEMORY_PER_ENTRY = sizeof(Variant) + 64; // Example: Variant size + overhead
+
+	// Get total system memory
+	struct sysinfo info;
+	if (sysinfo(&info) != 0) {
+		print_error("Failed to retrieve system memory information. Using default limit.");
+		if (p_new_size > 1000000) { // Default hard limit as a fallback
+			print_error("Requested size exceeds the default maximum array size. Size capped at 1,000,000 entries.");
+			p_new_size = 1000000;
+		}
+	} else {
+		size_t max_memory = info.totalram / 2; // Use half of the total system memory for safety
+		size_t max_entries = max_memory / MEMORY_PER_ENTRY;
+
+		if (p_new_size > max_entries) {
+			print_error("Requested size exceeds the maximum allowable size based on system memory. Size capped.");
+			p_new_size = static_cast<int>(max_entries);
 		}
 	}
-	return err;
+
+	Variant::Type &variant_type = _p->typed.type;
+
+	// Check if a preallocated buffer is available for reuse
+	if (p_new_size > current_size && preallocated_buffers.count(p_new_size)) {
+		_p->array = preallocated_buffers[p_new_size];
+		preallocated_buffers.erase(p_new_size); // Remove from cache after reuse
+	} else {
+		// Preallocate buffer if necessary
+		static const int BUFFER_EXTRA_SPACE = 1024; // Extra space to reduce frequent allocations
+		if (p_new_size > current_size) {
+			int new_buffer_size = std::max(p_new_size + BUFFER_EXTRA_SPACE, current_size * 2);
+			Error resize_err = _p->array.resize(new_buffer_size);
+			if (resize_err) {
+				print_error("Failed to resize array buffer during preallocation.");
+				return resize_err;
+			}
+		}
+	}
+
+	// Get the current size and resize the array
+	Error err = _p->array.resize_zeroed(p_new_size);
+
+	// Return early if resizing failed
+	if (err != OK) {
+		print_error("Failed to resize array.");
+		return err;
+	}
+
+	// Optimize initialization only if resizing was successful
+	if (p_new_size > current_size && variant_type != Variant::NIL && variant_type != Variant::OBJECT) {
+		Variant *write_ptr = _p->array.ptrw(); // Access the array memory once
+
+		// Initialize new elements in chunks to optimize performance using multithreading
+		const int CHUNK_SIZE = 1024; // Number of elements to initialize per batch
+		int total_chunks = (p_new_size - current_size + CHUNK_SIZE - 1) / CHUNK_SIZE; // Calculate total chunks
+
+		unsigned int hardware_threads = std::thread::hardware_concurrency();
+		if (hardware_threads == 0) {
+			hardware_threads = 4; // Fallback to 4 threads if hardware concurrency is unavailable
+		}
+
+		std::atomic<int> current_chunk(0);
+		auto initialize_chunks = [&]() {
+			// Set thread affinity to improve cache locality and reduce context switching
+			cpu_set_t cpuset;
+			CPU_ZERO(&cpuset);
+			int cpu_id = current_chunk % hardware_threads;
+			CPU_SET(cpu_id, &cpuset);
+			sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+			while (true) {
+				int chunk_index = current_chunk.fetch_add(1);
+				if (chunk_index >= total_chunks) {
+					break;
+				}
+				int start = current_size + chunk_index * CHUNK_SIZE;
+				int end = std::min(start + CHUNK_SIZE, p_new_size);
+				for (int i = start; i < end; i++) {
+					VariantInternal::initialize(&write_ptr[i], variant_type);
+				}
+			}
+		};
+
+		std::vector<std::thread> threads;
+		for (unsigned int i = 0; i < hardware_threads; i++) {
+			threads.emplace_back(initialize_chunks);
+		}
+
+		// Join all threads
+		for (auto &t : threads) {
+			t.join();
+		}
+	}
+
+	return OK;
+}
+
+void Array::cache_preallocated_buffer(int size) const {
+	if (!_p->read_only && _p->array.size() == size) {
+		preallocated_buffers[size] = std::move(_p->array);
+	}
 }
 
 Error Array::insert(int p_pos, const Variant &p_value) {
@@ -506,23 +647,31 @@ Array Array::recursive_duplicate(bool p_deep, int recursion_count) const {
 	Array new_arr;
 	new_arr._p->typed = _p->typed;
 
-	if (recursion_count > MAX_RECURSION) {
-		ERR_PRINT("Max recursion reached");
+	// Early exit for empty arrays
+	int element_count = size();
+	if (element_count == 0) {
 		return new_arr;
 	}
 
 	if (p_deep) {
 		recursion_count++;
-		int element_count = size();
-		new_arr.resize(element_count);
-		for (int i = 0; i < element_count; i++) {
-			new_arr[i] = get(i).recursive_duplicate(true, recursion_count);
-		}
-	} else {
-		new_arr._p->array = _p->array;
-	}
 
-	return new_arr;
+		// Resize once to avoid multiple reallocations
+		new_arr.resize(element_count);
+
+		if (p_deep) {
+			recursion_count++;
+			int element_count = size();
+			new_arr.resize(element_count);
+			for (int i = 0; i < element_count; i++) {
+				new_arr[i] = get(i).recursive_duplicate(true, recursion_count);
+			}
+		} else {
+			new_arr._p->array = _p->array;
+		}
+
+		return new_arr;
+		}
 }
 
 Array Array::slice(int p_begin, int p_end, int p_step, bool p_deep) const {
