@@ -39,6 +39,7 @@
 #include <sched.h> // For thread affinity
 #include <unordered_map>
 #include <sys/sysinfo.h> // For getting system memory (Linux/Unix)
+#include <random>
 
 #include "container_type_validate.h"
 #include "core/math/math_funcs.h"
@@ -884,17 +885,64 @@ void Array::sort_custom(const Callable &p_callable) {
 }
 
 void Array::shuffle() {
+	// Early exit if the array is in read-only state
 	ERR_FAIL_COND_MSG(_p->read_only, "Array is in read-only state.");
+
+	// Early exit if the array has fewer than 2 elements
 	const int n = _p->array.size();
 	if (n < 2) {
 		return;
 	}
-	Variant *data = _p->array.ptrw();
-	for (int i = n - 1; i >= 1; i--) {
-		const int j = Math::rand() % (i + 1);
-		const Variant tmp = data[j];
-		data[j] = data[i];
-		data[i] = tmp;
+
+	// Optimize random number generation
+	std::random_device rd;  // Seed for the random number generator
+	std::mt19937 gen(rd()); // Mersenne Twister engine for better randomness
+
+	// Precompute random indices
+	std::vector<int> indices(n);
+	for (int i = 0; i < n; i++) {
+		indices[i] = i;
+	}
+	std::shuffle(indices.begin(), indices.end(), gen); // Shuffle the indices
+
+	// Shuffle the array in parallel using a thread pool
+	constexpr int CHUNK_SIZE = 1024; // Number of elements per chunk
+	int num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE; // Calculate total chunks
+
+	unsigned int hardware_threads = std::thread::hardware_concurrency();
+	if (hardware_threads == 0) {
+		hardware_threads = 4; // Fallback to 4 threads if hardware concurrency is unavailable
+	}
+
+	std::atomic<int> current_chunk(0);
+	auto shuffle_chunk = [&](int thread_id) {
+		// Set thread affinity to improve cache locality
+		cpu_set_t cpuset;
+		CPU_ZERO(&cpuset);
+		CPU_SET(thread_id, &cpuset); // Bind thread to a specific CPU core
+		sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+		while (true) {
+			int chunk_index = current_chunk.fetch_add(1);
+			if (chunk_index >= num_chunks) {
+				break;
+			}
+			int start = chunk_index * CHUNK_SIZE;
+			int end = std::min(start + CHUNK_SIZE, n);
+			for (int i = start; i < end; i++) {
+				std::swap(_p->array.ptrw()[i], _p->array.ptrw()[indices[i]]); // Swap elements
+			}
+		}
+	};
+
+	std::vector<std::thread> threads;
+	for (unsigned int i = 0; i < hardware_threads; i++) {
+		threads.emplace_back(shuffle_chunk, i); // Pass thread ID to bind to specific core
+	}
+
+	// Join all threads
+	for (auto &t : threads) {
+		t.join();
 	}
 }
 
