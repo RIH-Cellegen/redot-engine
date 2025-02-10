@@ -266,6 +266,10 @@ void Array::assign(const Array &p_array) {
 		const Variant *source = p_array._p->array.ptr();
 		int size = p_array._p->array.size();
 
+		// Precompute error message templates to avoid repeated string formatting
+		const String type_conversion_error = R"(Unable to convert array index %d from "%s" to "%s".)";
+		const String type_assignment_error = R"(Cannot assign contents of "Array[%s]" to "Array[%s]".)";
+
 		// Handle specific type conversion cases
 		if ((source_typed.type == Variant::NIL && typed.type == Variant::OBJECT) ||
 			(source_typed.type == Variant::OBJECT && source_typed.can_reference(typed))) {
@@ -274,51 +278,51 @@ void Array::assign(const Array &p_array) {
 				const Variant &element = source[i];
 				if (element.get_type() != Variant::NIL &&
 					(element.get_type() != Variant::OBJECT || !typed.validate_object(element, "assign"))) {
-					ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
+					ERR_FAIL_MSG(vformat(type_conversion_error, i, Variant::get_type_name(element.get_type()), Variant::get_type_name(typed.type)));
 					}
 			}
-		_p->array = p_array._p->array;
+			_p->array = p_array._p->array;
 		return;
 			}
 
-	// Handle incompatible types
-	if (typed.type == Variant::OBJECT || source_typed.type == Variant::OBJECT) {
-		ERR_FAIL_MSG(vformat(R"(Cannot assign contents of "Array[%s]" to "Array[%s]".)", Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
-	}
-
-	// Perform type conversion for primitive types
-	Vector<Variant> array;
-	array.resize(size);
-	Variant *data = array.ptrw();
-
-	if (source_typed.type == Variant::NIL && typed.type != Variant::OBJECT) {
-		// Convert from variants to primitives
-		for (int i = 0; i < size; i++) {
-			const Variant *value = source + i;
-			if (value->get_type() == typed.type) {
-				data[i] = *value;
-				continue;
+			// Handle incompatible types
+			if (typed.type == Variant::OBJECT || source_typed.type == Variant::OBJECT) {
+				ERR_FAIL_MSG(vformat(type_assignment_error, Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
 			}
-			if (!Variant::can_convert_strict(value->get_type(), typed.type)) {
-				ERR_FAIL_MSG(vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
-			}
-			Callable::CallError ce;
-			Variant::construct(typed.type, data[i], &value, 1, ce);
-			ERR_FAIL_COND_MSG(ce.error, vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
-		}
-	} else if (Variant::can_convert_strict(source_typed.type, typed.type)) {
-		// Convert from primitives to different convertible primitives
-		for (int i = 0; i < size; i++) {
-			const Variant *value = source + i;
-			Callable::CallError ce;
-			Variant::construct(typed.type, data[i], &value, 1, ce);
-			ERR_FAIL_COND_MSG(ce.error, vformat(R"(Unable to convert array index %d from "%s" to "%s".)", i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
-		}
-	} else {
-		ERR_FAIL_MSG(vformat(R"(Cannot assign contents of "Array[%s]" to "Array[%s]".)", Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
-	}
 
-	_p->array = array;
+			// Perform type conversion for primitive types
+			Vector<Variant> array;
+			array.resize(size);
+			Variant *data = array.ptrw();
+
+			if (source_typed.type == Variant::NIL && typed.type != Variant::OBJECT) {
+				// Convert from variants to primitives
+				for (int i = 0; i < size; i++) {
+					const Variant *value = source + i;
+					if (value->get_type() == typed.type) {
+						data[i] = *value;
+						continue;
+					}
+					if (!Variant::can_convert_strict(value->get_type(), typed.type)) {
+						ERR_FAIL_MSG(vformat(type_conversion_error, i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
+					}
+					Callable::CallError ce;
+					Variant::construct(typed.type, data[i], &value, 1, ce);
+					ERR_FAIL_COND_MSG(ce.error, vformat(type_conversion_error, i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
+				}
+			} else if (Variant::can_convert_strict(source_typed.type, typed.type)) {
+				// Convert from primitives to different convertible primitives
+				for (int i = 0; i < size; i++) {
+					const Variant *value = source + i;
+					Callable::CallError ce;
+					Variant::construct(typed.type, data[i], &value, 1, ce);
+					ERR_FAIL_COND_MSG(ce.error, vformat(type_conversion_error, i, Variant::get_type_name(value->get_type()), Variant::get_type_name(typed.type)));
+				}
+			} else {
+				ERR_FAIL_MSG(vformat(type_assignment_error, Variant::get_type_name(source_typed.type), Variant::get_type_name(typed.type)));
+			}
+
+			_p->array = array;
 }
 
 void Array::push_back(const Variant &p_value) {
