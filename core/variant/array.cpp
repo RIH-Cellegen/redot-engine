@@ -40,6 +40,9 @@
 #include <unordered_map>
 #include <sys/sysinfo.h> // For getting system memory (Linux/Unix)
 #include <random>
+#include <future>
+#include <immintrin.h> // For SIMD (AVX2/AVX/...) on x86 platforms
+#include <mutex>   // For thread-safe operations
 
 #include "container_type_validate.h"
 #include "core/math/math_funcs.h"
@@ -745,29 +748,59 @@ Array Array::slice(int p_begin, int p_end, int p_step, bool p_deep) const {
 }
 
 Array Array::filter(const Callable &p_callable) const {
+	const int array_size = size();
+
+	// Early return if the input array is empty
+	if (array_size == 0) {
+		return Array();
+	}
+
 	Array new_arr;
-	new_arr.resize(size());
 	new_arr._p->typed = _p->typed;
-	int accepted_count = 0;
 
 	const Variant *argptrs[1];
-	for (int i = 0; i < size(); i++) {
-		argptrs[0] = &get(i);
+	Variant result;          // Reuse for callable results
+	Callable::CallError ce;  // Reuse for error tracking
 
-		Variant result;
-		Callable::CallError ce;
-		p_callable.callp(argptrs, 1, result, ce);
-		if (ce.error != Callable::CallError::CALL_OK) {
-			ERR_FAIL_V_MSG(Array(), vformat("Error calling method from 'filter': %s.", Variant::get_callable_error_text(p_callable, argptrs, 1, ce)));
+	// Use a hash map to cache the results of p_callable for unique inputs
+	HashMap<Variant, bool, VariantHasher> result_cache;
+
+	Vector<Variant> temp_buffer;
+
+	for (int i = 0; i < array_size; ++i) {
+		const Variant &current_element = get(i);
+
+		// Check if the result for the current element is already cached
+		if (result_cache.has(current_element)) {
+			if (result_cache[current_element]) {
+				temp_buffer.push_back(current_element);
+			}
+			continue;
 		}
 
-		if (result.operator bool()) {
-			new_arr[accepted_count] = get(i);
-			accepted_count++;
+		// Call the callable function
+		argptrs[0] = &current_element;
+		p_callable.callp(argptrs, 1, result, ce);
+
+		// Skip if callable errors occur
+		if (ce.error != Callable::CallError::CALL_OK) {
+			ERR_PRINT(vformat("Error calling method from 'filter': %s.", Variant::get_callable_error_text(p_callable, argptrs, 1, ce)));
+			result_cache[current_element] = false; // Cache the failure
+			continue;
+		}
+
+		// Cache the result
+		bool passes_filter = result.operator bool();
+		result_cache[current_element] = passes_filter;
+
+		// Add to the buffer if the element passes the filter
+		if (passes_filter) {
+			temp_buffer.push_back(current_element);
 		}
 	}
 
-	new_arr.resize(accepted_count);
+	// Move elements from the temporary buffer into the result array
+	new_arr._p->array = std::move(temp_buffer);
 
 	return new_arr;
 }
