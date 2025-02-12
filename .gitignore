@@ -380,3 +380,4 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+core/variant/array copy.cpp
